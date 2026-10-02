@@ -2,91 +2,46 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<link rel="manifest" href="manifest.webmanifest">
-<link rel="apple-touch-icon" href="icon-192.png">
-<meta name="theme-color" content="#0f1a2b">
-<title>Piano Note Detector</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Note Pitch Detector</title>
 <style>
-  :root {
-    --bg: #0f1a2b;
-    --card: #182740;
-    --line: #26385a;
-    --acc: #ff6b4a;
-    --ink: #eef3fb;
-    --mut: #92a3bd;
-  }
   body {
     font-family: system-ui, sans-serif;
-    background: var(--bg);
-    color: var(--ink);
+    background: #0f1a2b;
+    color: #eef3fb;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     min-height: 100vh;
     margin: 0;
-    padding: 16px;
+    padding: 20px;
     box-sizing: border-box;
   }
   .card {
-    background: var(--card);
-    border: 1px solid var(--line);
+    background: #182740;
+    border: 1px solid #26385a;
     border-radius: 16px;
-    padding: 24px;
+    padding: 32px;
     text-align: center;
-    max-width: 500px;
+    max-width: 400px;
     width: 100%;
     box-shadow: 0 8px 24px rgba(0,0,0,0.3);
   }
   .note {
-    font-size: 64px;
+    font-size: 80px;
     font-weight: 800;
-    color: var(--acc);
-    margin: 10px 0 4px;
-    min-height: 80px;
+    color: #ff6b4a;
+    margin: 20px 0 10px;
+    min-height: 100px;
   }
   .freq {
-    font-size: 16px;
-    color: var(--mut);
-    margin-bottom: 20px;
-  }
-  .keyboard-wrapper {
-    overflow-x: auto;
-    margin-bottom: 20px;
-    padding: 10px 0;
-  }
-  .keyboard {
-    position: relative;
-    display: inline-flex;
-    height: 120px;
-    user-select: none;
-  }
-  .white-key {
-    width: 32px;
-    height: 100%;
-    background: #fff;
-    border: 1px solid #ccc;
-    border-radius: 0 0 4px 4px;
-    box-sizing: border-box;
-    position: relative;
-    z-index: 1;
-  }
-  .black-key {
-    width: 20px;
-    height: 60%;
-    background: #222;
-    position: absolute;
-    z-index: 2;
-    border-radius: 0 0 3px 3px;
-    transform: translateX(-50%);
-  }
-  .key.active {
-    background: var(--acc) !important;
-    box-shadow: 0 0 12px var(--acc);
+    font-size: 18px;
+    color: #92a3bd;
+    margin-bottom: 24px;
   }
   button {
-    background: var(--acc);
+    background: #ff6b4a;
     color: #fff;
     border: 0;
     padding: 14px 28px;
@@ -104,66 +59,29 @@
   <h2>Piano Note Detector</h2>
   <div id="note" class="note">--</div>
   <div id="freq" class="freq">0 Hz</div>
-
-  <div class="keyboard-wrapper">
-    <div id="keyboard" class="keyboard"></div>
-  </div>
-
   <button id="btn" onclick="toggleMic()">Start Listening</button>
 </div>
 
 <script>
 let audioCtx, analyser, micStream, isListening = false;
 const notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-const keyMap = {};
-
-function buildKeyboard() {
-  const kb = document.getElementById("keyboard");
-  kb.innerHTML = "";
-  let whiteIndex = 0;
-  for (let octave = 3; octave <= 4; octave++) {
-    notes.forEach((name, i) => {
-      const isSharp = name.includes("#");
-      const key = document.createElement("div");
-      const midi = (octave + 1) * 12 + i;
-      key.dataset.midi = midi;
-      keyMap[midi] = key;
-      if (!isSharp) {
-        key.className = "white-key key";
-        key.style.left = `${whiteIndex * 32}px`;
-        whiteIndex++;
-      } else {
-        key.className = "black-key key";
-        key.style.left = `${whiteIndex * 32}px`;
-      }
-      kb.appendChild(key);
-    });
-  }
-  kb.style.width = `${whiteIndex * 32}px`;
-}
 
 async function toggleMic() {
   if (isListening) location.reload();
-
+  
   try {
-    const AudioContext = window.AudioContext || window.webkitAudioContext;
-    audioCtx = new AudioContext();
-    if (audioCtx.state === "suspended") await audioCtx.resume();
-
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-    });
-
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const source = audioCtx.createMediaStreamSource(micStream);
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 4096;
     source.connect(analyser);
-
+    
     document.getElementById("btn").textContent = "Stop Listening";
     isListening = true;
     detect();
   } catch (err) {
-    alert("Mobile error: " + (err.message || err.name) + ". Ensure you are on HTTPS, not HTTP.");
+    alert("Microphone access denied or not supported.");
   }
 }
 
@@ -171,7 +89,7 @@ function autoCorrelate(buf, sampleRate) {
   let rms = 0;
   for (let i = 0; i < buf.length; i++) rms += buf[i] * buf[i];
   rms = Math.sqrt(rms / buf.length);
-  if (rms < 0.02) return -1;
+  if (rms < 0.02) return -1; // Ignore silence/background noise
 
   let r1 = 0, r2 = buf.length - 1, thres = 0.2;
   for (let i = 0; i < buf.length / 2; i++) {
@@ -198,7 +116,8 @@ function autoCorrelate(buf, sampleRate) {
       maxpos = i;
     }
   }
-  return sampleRate / maxpos;
+  let T0 = maxpos;
+  return sampleRate / T0;
 }
 
 function detect() {
@@ -206,28 +125,19 @@ function detect() {
   analyser.getFloatTimeDomainData(buf);
   const pitch = autoCorrelate(buf, audioCtx.sampleRate);
 
-  document.querySelectorAll(".key").forEach(k => k.classList.remove("active"));
-
-  if (pitch !== -1 && isFinite(pitch)) {
+  if (pitch !== -1) {
     const noteNum = 12 * (Math.log2(pitch / 440)) + 69;
     const rounded = Math.round(noteNum);
     const noteName = notes[rounded % 12];
     const octave = Math.floor(rounded / 12) - 1;
-
+    
     document.getElementById("note").textContent = `${noteName}${octave}`;
     document.getElementById("freq").textContent = `${Math.round(pitch)} Hz`;
-
-    if (keyMap[rounded]) {
-      keyMap[rounded].classList.add("active");
-    }
   }
-
+  
   if (isListening) requestAnimationFrame(detect);
 }
-
-buildKeyboard();
-
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
 </script>
+
 </body>
 </html>
