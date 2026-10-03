@@ -327,43 +327,68 @@ let ph = 0, phShown = 0;   // playhead in quarters
 let t0 = 0, bpmRun = 26;   // rhythm/listen: audio time when segment start is reached
 let loop = 0, mistakes = 0, hitCount = 0, lastAcc = null;
 let wakeLock = null;
+let runStart = 0;          // where the current pass started (you can start mid-segment)
 
-function resetRun() {
+// Start (or restart) a pass from time `from` (in quarters); everything before it is left alone.
+function resetRun(from = seg.start) {
   steps.forEach(s => s.status = null);
-  cur = 0; mistakes = 0; hitCount = 0;
-  ph = phShown = seg.start;
+  mistakes = 0; hitCount = 0;
+  cur = steps.findIndex(s => s.t >= from - 1e-6); if (cur < 0) cur = 0;
+  runStart = steps[cur] ? Math.min(steps[cur].t, from) : seg.start;
+  ph = steps[cur] ? steps[cur].t : seg.start;
 }
+// The spot you're currently at: the next note to play
+const posT = () => steps[cur] ? steps[cur].t : seg.start;
+const beatFloor = t => seg.start + Math.floor(t - seg.start + 1e-6);
+
 async function startPractice() {
   audio();
+  const from = posT();
   if (!(await startMic())) return;
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
-  loop = 0; lastAcc = null; resetRun();
-  if (S.mode === "wait") { state = "wait"; showBanner("<b>Your turn</b>Play the glowing note — I'll wait.", 1800); }
-  else startRhythmLoop(4);
+  loop = 0; lastAcc = null;
+  beginMode(from, true);
   updateButtons();
 }
-function startRhythmLoop(countIn) {
-  stopScheduled(); resetRun();
+function beginMode(from, greet) {
+  stopScheduled();
+  if (S.mode === "wait") {
+    resetRun(from); state = "wait";
+    if (greet) showBanner("<b>Your turn</b>Play the glowing note — I'll wait.", 1800);
+  } else startRhythmLoop(4, from);
+}
+function startRhythmLoop(countIn, from = seg.start) {
+  stopScheduled();
+  from = beatFloor(from);
+  resetRun(from);
   state = "rhythm"; bpmRun = S.bpm;
   const spb = 60 / bpmRun, a = audio();
-  t0 = a.currentTime + 0.15 + countIn * spb;
-  scheduleSegment(t0, spb, { notes: S.accomp ? "other" : "none", clicks: S.click, countIn });
+  // t0 = the moment the segment's first beat *would* be; we start part-way in at `from`
+  t0 = a.currentTime + 0.15 + countIn * spb - (from - seg.start) * spb;
+  ph = phShown = from - countIn;
+  scheduleSegment(t0, spb, { notes: S.accomp ? "other" : "none", clicks: S.click, countIn, from });
 }
 function startListen() {
-  audio(); stopScheduled(); resetRun();
+  audio(); stopScheduled();
+  let from = beatFloor(posT());
+  if (from >= seg.end - 1e-6) from = seg.start;
+  resetRun(from);
   state = "listen"; bpmRun = S.bpm;
   const spb = 60 / bpmRun;
-  t0 = audio().currentTime + 0.25;
-  scheduleSegment(t0, spb, { notes: "all", clicks: S.click, countIn: 0 });
+  t0 = audio().currentTime + 0.25 - (from - seg.start) * spb;
+  scheduleSegment(t0, spb, { notes: "all", clicks: S.click, countIn: 0, from });
   updateButtons();
 }
 function scheduleSegment(start, spb, o) {
-  for (let i = o.countIn; i > 0; i--) playClick(start - i * spb, i === o.countIn);
+  const from = o.from ?? seg.start, first = start + (from - seg.start) * spb;
+  for (let i = o.countIn; i > 0; i--) playClick(first - i * spb, i === o.countIn);
   if (o.clicks) for (let q = 0; seg.start + q < seg.end - 1e-6; q++) {
     const t = seg.start + q, accent = SCORE.bars.some(b => Math.abs(b - t) < 1e-6);
+    if (t < from - 1e-6) continue;
     playClick(start + q * spb, accent);
   }
   for (const n of segNotes) {
+    if (n.t < from - 1e-6) continue;
     const mineN = S.hand === "B" || n.h === S.hand;
     if (o.notes === "none" || (o.notes === "other" && mineN)) continue;
     playNote(n.m, start + (n.t - seg.start) * spb, n.d * spb, n.h === "L" ? 0.18 : (n.d >= 0.75 ? 0.32 : 0.2));
@@ -377,7 +402,8 @@ function stopAll() {
 function finishLoop() {
   loop++;
   if (state === "wait") {
-    const acc = Math.round(100 * steps.length / (steps.length + mistakes));
+    const played = steps.filter(s => s.t >= runStart - 1e-6).length;
+    const acc = Math.round(100 * played / Math.max(1, played + mistakes));
     lastAcc = acc;
     showBanner(`<b>Loop ${loop} done</b>${mistakes === 0 ? "No wrong notes!" : mistakes + " wrong note" + (mistakes > 1 ? "s" : "")} · going again`, 2200);
     recordBest(acc);
@@ -385,8 +411,9 @@ function finishLoop() {
     return;
   }
   // rhythm
-  const hits = steps.filter(s => s.status === "hit").length;
-  const acc = Math.round(100 * hits / Math.max(1, steps.length));
+  const inPass = steps.filter(s => s.t >= runStart - 1e-6);
+  const hits = inPass.filter(s => s.status === "hit").length;
+  const acc = Math.round(100 * hits / Math.max(1, inPass.length));
   lastAcc = acc;
   let msg = "Nice — same speed again";
   if (acc < 85) msg = "Aim for 85% — same speed again";
@@ -440,18 +467,19 @@ function tick() {
           mistakes++; setHeard(spell(ev) + " ✗", "bad");   // a note that isn't anywhere nearby in the music
         }
       }
-      for (const s of steps) if (!s.status && ph - lat > s.t + tol + 0.25) s.status = "miss";
-      cur = steps.findIndex(s => s.t >= ph - 0.05); if (cur < 0) cur = steps.length;
+      for (const s of steps) if (!s.status && s.t >= runStart - 1e-6 && ph - lat > s.t + tol + 0.25) s.status = "miss";
+      cur = steps.findIndex(s => s.t >= Math.max(ph, runStart) - 0.05); if (cur < 0) cur = steps.length;
     } else {
-      cur = steps.findIndex(s => s.t >= ph - 0.05); if (cur < 0) cur = steps.length;
+      cur = steps.findIndex(s => s.t >= Math.max(ph, runStart) - 0.05); if (cur < 0) cur = steps.length;
     }
     if (ph >= seg.end + 0.05) {
       if (state === "rhythm") finishLoop();
-      else { state = "idle"; ph = seg.start; cur = 0; updateButtons(); }
+      else { state = "idle"; resetRun(seg.start); updateButtons(); }
     }
   }
   // smooth scrolling in wait mode, exact in timed modes
-  phShown = state === "wait" ? phShown + (ph - phShown) * 0.25 : (state === "idle" ? phShown + (ph - phShown) * 0.25 : ph);
+  if (!scroll.active) phShown = (state === "wait" || state === "idle") ? phShown + (ph - phShown) * 0.25
+    : Math.max(ph, runStart);   // during the count-in, hold still at your starting spot
   updateStatus();
   draw();
   requestAnimationFrame(tick);
@@ -531,6 +559,7 @@ function draw() {
   const kbH = Math.max(70, Math.min(140, H * 0.24)), top = H - kbH;
   const { pos, ww } = keyGeom();
   const pxq = Math.max(60, Math.min(top / 4.2, 170)); // pixels per quarter note
+  lastPxq = pxq;
   const view = phShown;
   // bar lines and beats
   g.font = "600 11px system-ui"; g.textBaseline = "bottom";
@@ -575,6 +604,10 @@ function draw() {
     }
   }
   g.globalAlpha = 1; g.textAlign = "left";
+  if (state === "idle" || state === "wait") {
+    g.font = "600 11px system-ui"; g.fillStyle = "rgba(146,163,189,0.55)"; g.textAlign = "right"; g.textBaseline = "top";
+    g.fillText("↕ drag to scroll", W - 8, 6); g.textAlign = "left";
+  }
   // hit line
   g.fillStyle = "rgba(255,255,255,0.25)"; g.fillRect(0, top - 2, W, 2);
   // wrong-note flash
@@ -602,6 +635,7 @@ function draw() {
     }
   }
 }
+let lastPxq = 100;
 function roundRect(x, y, w, h, r) {
   g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
   g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
@@ -609,9 +643,12 @@ function roundRect(x, y, w, h, r) {
 
 // ---------- Controls ----------
 function setSeg(button, val) { button.querySelectorAll("button").forEach(b => b.classList.toggle("on", b.dataset.v === val)); }
-function rebuild() {
+function rebuild(keepT) {
   if (state !== "idle") stopAll();
-  buildSegment(); resetRun(); phShown = seg.start; lastAcc = null; loop = 0;
+  buildSegment();
+  const t = keepT != null && keepT >= seg.start && keepT < seg.end ? keepT : seg.start;
+  resetRun(t); if (keepT == null) phShown = seg.start;
+  lastAcc = null; loop = 0;
   $("custom").classList.toggle("show", !!SEGMENTS[S.segIdx].custom);
   save(); updateStatus();
 }
@@ -631,8 +668,17 @@ function init() {
   $("sens").value = S.sens; $("sens").oninput = () => { S.sens = +$("sens").value; save(); };
   $("seg").onchange = () => { S.segIdx = +$("seg").value; rebuild(); };
   $("from").onchange = $("to").onchange = () => { S.from = +$("from").value; S.to = +$("to").value; rebuild(); };
-  $("mode").onclick = e => { const v = e.target.dataset?.v; if (!v) return; S.mode = v; setSeg($("mode"), v); rebuild(); };
-  $("hand").onclick = e => { const v = e.target.dataset?.v; if (!v) return; S.hand = v; setSeg($("hand"), v); rebuild(); };
+  // Switching mode keeps your place (and keeps going if you were practising)
+  $("mode").onclick = e => {
+    const v = e.target.dataset?.v; if (!v || v === S.mode) return;
+    S.mode = v; setSeg($("mode"), v); save();
+    const from = posT();
+    if (state === "wait" || state === "rhythm") { loop = 0; lastAcc = null; beginMode(from, false); updateButtons(); }
+    else if (state === "listen") { stopAll(); resetRun(from); }
+    updateStatus();
+  };
+  $("hand").onclick = e => { const v = e.target.dataset?.v; if (!v || v === S.hand) return; S.hand = v; setSeg($("hand"), v); rebuild(posT()); };
+  setupScroll();
   $("bpm").oninput = () => { S.bpm = +$("bpm").value; updateBpmLabel(); save(); };
   $("gear").onclick = () => $("opts").classList.toggle("show");
   $("go").onclick = () => (state === "wait" || state === "rhythm") ? stopAll() : startPractice();
@@ -656,6 +702,54 @@ function init() {
   $("custom").classList.toggle("show", !!SEGMENTS[S.segIdx].custom);
   resize(); requestAnimationFrame(tick);
 }
+// ---------- Scrolling the notes (drag / mouse wheel) ----------
+const scroll = { active: false, y0: 0, v0: 0, timer: 0 };
+function clampView(v) { return Math.max(seg.start - 0.5, Math.min(seg.end, v)); }
+function pauseTimed() {
+  if (state === "rhythm" || state === "listen") {
+    stopAll();
+    showBanner("<b>Paused</b>Scroll to any spot, then press Practice (or Listen) to carry on from there.", 2600);
+  }
+}
+// After scrolling, the note sitting on the line becomes your new starting point
+function settleScroll() {
+  scroll.active = false;
+  let i = steps.findIndex(s => s.t >= phShown - 0.17);
+  if (i < 0) i = steps.length - 1;
+  cur = Math.max(0, i);
+  for (let k = cur; k < steps.length; k++) steps[k].status = null;
+  ph = posT();
+}
+function setupScroll() {
+  cv.style.touchAction = "none";
+  let down = null;
+  cv.addEventListener("pointerdown", e => {
+    down = { y: e.clientY, id: e.pointerId };
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener("pointermove", e => {
+    if (!down || scroll.timer) return;
+    if (!scroll.active) {
+      if (Math.abs(e.clientY - down.y) < 8) return;      // a tap isn't a scroll
+      pauseTimed();
+      scroll.active = true; scroll.y0 = e.clientY; scroll.v0 = phShown;
+    }
+    // the notes follow your finger: drag up to go back, drag down to go forward
+    phShown = clampView(scroll.v0 + (e.clientY - scroll.y0) / lastPxq);
+  });
+  const up = () => { down = null; if (scroll.active && !scroll.timer) settleScroll(); };
+  cv.addEventListener("pointerup", up);
+  cv.addEventListener("pointercancel", up);
+  cv.addEventListener("wheel", e => {
+    e.preventDefault();
+    pauseTimed();
+    scroll.active = true;
+    phShown = clampView(phShown - e.deltaY / lastPxq * 0.5);
+    clearTimeout(scroll.timer);
+    scroll.timer = setTimeout(() => { scroll.timer = 0; settleScroll(); }, 220);
+  }, { passive: false });
+}
+
 init();
 
 if ("serviceWorker" in navigator) {
