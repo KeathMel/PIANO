@@ -1,12 +1,12 @@
 {
   "id": "./",
-  "name": "Piano Note Detector",
-  "short_name": "Pitch",
-  "description": "Detect the piano note you play using your microphone.",
+  "name": "Moonlight Practice",
+  "short_name": "Moonlight",
+  "description": "Learn the first movement of Beethoven's Moonlight Sonata segment by segment, with your microphone listening.",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
-  "orientation": "portrait",
+  "orientation": "any",
   "background_color": "#0f1a2b",
   "theme_color": "#0f1a2b",
   "icons": [
