@@ -38,6 +38,7 @@
   .seg button.on { background:var(--accent); color:#fff; }
   .tempo { display:flex; align-items:center; gap:8px; flex:1; min-width:200px; }
   .tempo input { flex:1; accent-color:var(--accent); }
+  .tempo em { font-style:normal; font-size:13px; color:var(--muted); width:66px; flex:none; }
   .tempo span { font-size:13px; color:var(--muted); white-space:nowrap; min-width:96px; text-align:right; }
   .opts { display:none; gap:12px; flex-wrap:wrap; font-size:14px; color:var(--muted); }
   .opts.show { display:flex; }
@@ -97,8 +98,16 @@
   </div>
   <div class="row">
     <div class="tempo">
+ <em>Tempo</em>
       <input type="range" id="bpm" min="12" max="60" step="1" value="26" aria-label="Tempo">
       <span id="bpmLabel"></span>
+    </div>
+  </div>
+  <div class="row">
+    <div class="tempo">
+<em>Strictness</em>
+      <input type="range" id="level" min="1" max="5" step="1" value="3" aria-label="Strictness">
+      <span id="levelLabel"></span>
     </div>
   </div>
   <div class="opts" id="opts">
@@ -161,8 +170,18 @@ const S = {
   segIdx: store.get("segIdx", 0), from: store.get("from", 1), to: store.get("to", 4),
   mode: store.get("mode", "wait"), hand: store.get("hand", "R"), bpm: store.get("bpm", 26),
   click: store.get("click", true), auto: store.get("auto", true), accomp: store.get("accomp", false),
-  names: store.get("names", true), strict: store.get("strict", false), sens: store.get("sens", 6),
+  names: store.get("names", true), strict: store.get("strict", false), sens: store.get("sens", 6), level: store.get("level", 3),
 };
+// How strict the app is. Timing window is ± beats; "pass" is the score needed before it speeds up.
+const LEVELS = {
+  // ratio = how clearly the right note must stand out from other notes in what the mic heard
+  1: { name: "Relaxed", tol: 0.45, pass: 70, needStrike: false, ratio: 0.55 },
+  2: { name: "Easy",    tol: 0.35, pass: 78, needStrike: false, ratio: 0.62 },
+  3: { name: "Normal",  tol: 0.25, pass: 85, needStrike: true,  ratio: 0.7 },
+  4: { name: "Strict",  tol: 0.17, pass: 90, needStrike: true,  ratio: 0.82 },
+  5: { name: "Very strict", tol: 0.11, pass: 95, needStrike: true, ratio: 0.92 },
+};
+const LV = () => LEVELS[S.level] || LEVELS[3];
 const save = () => Object.entries(S).forEach(([k, v]) => store.set(k, v));
 
 // ---------- Segment / steps ----------
@@ -186,6 +205,7 @@ function buildSegment() {
   }
   steps = [...groups.values()].sort((a, b) => a.t - b.t);
   steps.forEach(s => { s.notes.sort((a, b) => a.m - b.m); s.status = null; });
+  updateRange();
   // keyboard range: the notes of the hand(s) you're practising, so keys stay big on a phone
   const ref = steps.length ? steps.flatMap(s => s.notes) : segNotes;
   let lo = Math.min(...ref.map(n => n.m)), hi = Math.max(...ref.map(n => n.m));
@@ -200,7 +220,7 @@ const isBlack = m => [1, 3, 6, 8, 10].includes(((m % 12) + 12) % 12);
 let ctx = null, scheduled = [];
 function audio() {
   if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
-  if (ctx.state === "suspended") ctx.resume();
+  if (ctx.state !== "running") ctx.resume().catch(() => {});
   return ctx;
 }
 function playNote(m, when, dur, vel = 0.25) {
@@ -233,8 +253,19 @@ function playClick(when, accent) {
 function stopScheduled() { scheduled.forEach(n => { try { n.stop(); } catch {} }); scheduled = []; }
 
 // ---------- Microphone pitch detection (YIN, one note at a time) ----------
-let mic = null, analyser = null, timeBuf = null, ds = null;
-let det = { lastOnset: 0, stableMidi: null, cand: null, candCount: 0, lastEventMidi: null, silent: 0, rmsHist: [], onset: false, muteUntil: 0, rms: 0 };
+let mic = null, analyser = null, timeBuf = null, ds = null, hpf = [];
+// Only listen in the pitch range of the hand you're practising. This stops e.g. a ringing
+// left-hand C♯ from being taken for the right hand's C♯4 (and skipping notes).
+let range = { lo: 21, hi: 108 };
+const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+function updateRange() {
+  const ms = steps.flatMap(s => s.notes.map(n => n.m));
+  range = ms.length ? { lo: Math.min(...ms) - 2, hi: Math.max(...ms) + 13 } : { lo: 21, hi: 108 };
+  // cut the bass below the range (two filters = a steep cut)
+  const cut = S.hand === "R" ? mtof(range.lo) * 0.8 : 30;
+  hpf.forEach(f => f.frequency.value = cut);
+}
+let det = { holdUntil: 0, evScores: null, pending: null, lastOnset: 0, stableMidi: null, cand: null, candCount: 0, lastEventMidi: null, silent: 0, rmsHist: [], onset: false, muteUntil: 0, rms: 0 };
 async function startMic() {
   if (analyser) return true;
   const a = audio();
@@ -245,8 +276,11 @@ async function startMic() {
     return false;
   }
   const src = a.createMediaStreamSource(mic);
-  analyser = a.createAnalyser(); analyser.fftSize = 4096;
-  src.connect(analyser);
+  analyser = a.createAnalyser(); analyser.fftSize = 4096; analyser.smoothingTimeConstant = 0;
+  hpf = [a.createBiquadFilter(), a.createBiquadFilter()];
+  hpf.forEach(f => { f.type = "highpass"; f.Q.value = 0.7; });
+  src.connect(hpf[0]); hpf[0].connect(hpf[1]); hpf[1].connect(analyser);
+  updateRange();
   timeBuf = new Float32Array(analyser.fftSize);
   return true;
 }
@@ -262,7 +296,8 @@ function yin(buf, sr) {
   for (let i = 0; i < n; i++) { let s = 0; for (let j = 0; j < k; j++) s += buf[i * k + j]; ds[i] = s / k; rms += ds[i] * ds[i]; }
   rms = Math.sqrt(rms / n);
   const fs = sr / k, W = Math.floor(n / 2);
-  const minLag = Math.floor(fs / 2100), maxLag = Math.min(W - 2, Math.floor(fs / 40));
+  const minLag = Math.max(2, Math.floor(fs / (mtof(range.hi) * 1.03))),
+        maxLag = Math.min(W - 2, Math.ceil(fs / (mtof(range.lo) * 0.97)));
   const d = new Float32Array(maxLag + 2);
   for (let tau = 1; tau <= maxLag + 1; tau++) {
     let s = 0;
@@ -278,37 +313,97 @@ function yin(buf, sr) {
   }
   if (tau < 0) { // fall back to global minimum if it's reasonably clear
     let best = 1, bt = -1;
-    for (let t = Math.max(2, minLag); t <= maxLag; t++) if (d[t] < best) { best = d[t]; bt = t; }
+    // only real dips count (not the edge of the search range)
+    for (let t = Math.max(3, minLag + 1); t < maxLag; t++) if (d[t] < best && d[t] <= d[t - 1] && d[t] <= d[t + 1]) { best = d[t]; bt = t; }
     if (best < 0.35) tau = bt; else return { rms, f: -1 };
   }
+  if (tau >= maxLag) return { rms, f: -1 };
   const a = d[tau - 1], b = d[tau], c = d[tau + 1], den = a - 2 * b + c;
   const shift = den ? 0.5 * (a - c) / den : 0;
   return { rms, f: fs / (tau + shift) };
 }
 // Turns the raw pitch stream into discrete "you just played X" events.
+// Spectrum of the latest audio, as linear power per frequency bin
+let fBuf = null;
+const specHist = [];
+function powerSpectrum() {
+  if (!fBuf || fBuf.length !== analyser.frequencyBinCount) fBuf = new Float32Array(analyser.frequencyBinCount);
+  analyser.getFloatFrequencyData(fBuf);
+  const p = new Float32Array(fBuf.length);
+  for (let i = 0; i < p.length; i++) p[i] = Math.pow(10, fBuf[i] / 10);
+  return p;
+}
+// Which key was just struck? Look at what got *louder* since just before the strike, and find
+// the note whose harmonics best explain that. Notes that were already ringing (pedal, bass)
+// didn't get louder, so they're ignored. This is what fixes the "C♯ skipped my notes" problem.
+function struckNote(before, after) {
+  const binHz = ctx.sampleRate / analyser.fftSize, n = after.length;
+  const rise = i => i < n ? Math.max(0, after[i] - before[i]) : 0;
+  const at = f => { const i = Math.floor(f / binHz); return Math.sqrt(Math.max(rise(i), rise(i + 1))); };
+  let best = 0, bm = null;
+  const scores = new Float32Array(128);
+  for (let m = range.lo; m <= range.hi; m++) {
+    const f0 = mtof(m); let sc = 0;
+    for (let h = 1; h <= 6; h++) sc += at(f0 * h) * Math.pow(0.8, h - 1);
+    scores[m] = sc;
+    if (sc > best) { best = sc; bm = m; }
+  }
+  return bm == null ? null : { m: bm, best, scores };
+}
 function listenFrame(now) {
   if (!analyser) return null;
   analyser.getFloatTimeDomainData(timeBuf);
   const { rms, f } = yin(timeBuf, ctx.sampleRate);
   det.rms = rms;
+  const spec = powerSpectrum();
+  specHist.push(spec); if (specHist.length > 8) specHist.shift();
   const gate = 0.045 / Math.pow(1.45, S.sens); // sensitivity 1..10
   const h = det.rmsHist; h.push(rms); if (h.length > 14) h.shift();
   const before = h.slice(0, -3), recentMin = before.length ? Math.min(...before) : rms;
   // a new key strike (even of the same note): loudness jumps, with a short refractory time
-  if (rms > gate * 1.5 && rms > recentMin * 1.8 && now - det.lastOnset > 0.18) { det.onset = true; det.lastOnset = now; }
+  // right after a strike the analysis window is still filling up with it, so the level keeps
+  // rising for a moment — don't mistake that for another strike
+  if (now < det.holdUntil) h.length = 0;
+  else if (h.length >= 4 && rms > gate * 1.5 && rms > recentMin * 1.4) {
+    det.onset = true; det.lastOnset = now; det.holdUntil = now + 0.1;
+    // remember the spectrum from just before the strike
+    const prev = specHist.slice(-5, -1);
+    if (prev.length) {
+      const before = new Float32Array(spec.length);
+      for (let i = 0; i < before.length; i++) { let m = Infinity; for (const p of prev) m = Math.min(m, p[i]); before[i] = m; }
+      det.pending = { t: now, before };
+    }
+  }
+  if (det.onset && now - det.lastOnset > 0.35) det.onset = false;   // a strike only counts for a short moment
+  // ~60 ms after a strike, decide which note it was
+  if (det.pending && now - det.pending.t >= 0.06) {
+    const r = struckNote(det.pending.before, spec);
+    det.pending = null;
+    if (r && now >= det.muteUntil) {
+      const m = r.m;
+      det.onset = false; det.lastEventMidi = m; det.stableMidi = m; det.cand = m; det.candCount = 3;
+      det.evScores = r;
+      return m;
+    }
+  }
   if (rms < gate || f < 0) {
     if (++det.silent > 8) { det.lastEventMidi = null; det.stableMidi = null; }
     det.cand = null; det.candCount = 0;
     return null;
   }
   det.silent = 0;
-  const midi = Math.round(69 + 12 * Math.log2(f / 440));
+  let midi = Math.round(69 + 12 * Math.log2(f / 440));
+  // notes blending with a ringing bass can read an octave low: keep the note name, move it up into range
+  if (midi < range.lo && !S.strict) midi += 12 * Math.ceil((range.lo - midi) / 12);
+  if (midi < range.lo || midi > range.hi) { det.cand = null; det.candCount = 0; return null; }
   if (midi === det.cand) det.candCount++; else { det.cand = midi; det.candCount = 1; }
   if (det.candCount < 3) return null;
   det.stableMidi = midi;
   if (now < det.muteUntil) { det.lastEventMidi = midi; det.onset = false; return null; }
-  if (midi !== det.lastEventMidi || det.onset) {
-    det.lastEventMidi = midi; det.onset = false;
+  // Normal and stricter: only a fresh key strike counts (handled above).
+  // Relaxed/Easy: a clear change of pitch also counts, for soft legato playing.
+  if (!LV().needStrike && !det.pending && midi !== det.lastEventMidi) {
+    det.lastEventMidi = midi; det.evScores = null;
     return midi;
   }
   return null;
@@ -318,7 +413,19 @@ function recentlyPlayed(midi) {
   for (let i = Math.max(0, cur - 3); i < cur; i++) if (matches(steps[i], midi)) return true;
   return false;
 }
-const matches = (step, midi) => step.notes.some(n => S.strict ? n.m === midi : (n.m - midi) % 12 === 0);
+function matches(step, midi) {
+  const E = det.evScores && det.evScores.m === midi ? det.evScores : null;
+  if (E) {
+    // the expected note just needs to be clearly present in what got louder
+    const need = LV().ratio * E.best;
+    return step.notes.some(n => {
+      let sc = E.scores[n.m] || 0;
+      if (!S.strict) sc = Math.max(sc, E.scores[n.m - 12] || 0, E.scores[n.m + 12] || 0);
+      return sc >= need;
+    });
+  }
+  return step.notes.some(n => S.strict ? n.m === midi : (n.m - midi) % 12 === 0);
+}
 
 // ---------- Practice engine ----------
 let state = "idle";        // idle | wait | rhythm | listen
@@ -345,6 +452,7 @@ async function startPractice() {
   audio();
   const from = posT();
   if (!(await startMic())) return;
+  try { await ctx.resume(); } catch {}
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
   loop = 0; lastAcc = null;
   beginMode(from, true);
@@ -394,11 +502,17 @@ function scheduleSegment(start, spb, o) {
     playNote(n.m, start + (n.t - seg.start) * spb, n.d * spb, n.h === "L" ? 0.18 : (n.d >= 0.75 ? 0.32 : 0.2));
   }
 }
+// Stopping or pausing keeps the microphone open, so resuming is instant and the
+// audio clock keeps running (turning the mic off and on again froze things on phones).
 function stopAll() {
-  stopScheduled(); state = "idle";
+  stopScheduled(); state = "idle"; ph = posT();
   try { wakeLock?.release(); } catch {} wakeLock = null;
-  stopMic(); updateButtons(); setHeard("–");
+  updateButtons(); setHeard("–");
 }
+// Let go of the mic when the app is in the background
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { if (state !== "idle") stopAll(); stopMic(); }
+});
 function finishLoop() {
   loop++;
   if (state === "wait") {
@@ -416,7 +530,7 @@ function finishLoop() {
   const acc = Math.round(100 * hits / Math.max(1, inPass.length));
   lastAcc = acc;
   let msg = "Nice — same speed again";
-  if (acc < 85) msg = "Aim for 85% — same speed again";
+  if (acc < LV().pass) msg = `Aim for ${LV().pass}% — same speed again`;
   else if (S.auto && S.bpm < 60) {
     S.bpm = Math.min(60, S.bpm + 2); $("bpm").value = S.bpm; updateBpmLabel(); save();
     msg = `Speeding up to ♩ = ${S.bpm}`;
@@ -432,15 +546,16 @@ function recordBest(acc) {
 }
 
 function tick() {
+  if (ctx && state !== "idle" && ctx.state !== "running") ctx.resume().catch(() => {});
   const now = ctx ? ctx.currentTime : 0;
   const ev = (state === "wait" || state === "rhythm") ? listenFrame(now) : null;
-  if (det.stableMidi != null && analyser && performance.now() - heardAt > 700) setHeard(spell(det.stableMidi), "", true);
+  if (!LV().needStrike && det.stableMidi != null && analyser && performance.now() - heardAt > 700) setHeard(spell(det.stableMidi), "", true);
   $("level").style.width = Math.min(100, (det.rms || 0) * 900) + "%";
 
   if (state === "wait") {
     if (ev != null && steps[cur]) {
       if (matches(steps[cur], ev)) {
-        setHeard(spell(ev), "ok");
+        setHeard(steps[cur].notes[0].name, "ok");
         steps[cur].status = "hit"; cur++; hitCount++;
         if (cur >= steps.length) finishLoop();
       } else if (!recentlyPlayed(ev)) {
@@ -451,23 +566,24 @@ function tick() {
   } else if (state === "rhythm" || state === "listen") {
     ph = seg.start + (now - t0) * bpmRun / 60;
     if (state === "rhythm") {
-      const lat = 0.12 * bpmRun / 60;           // ~120 ms detection delay, in beats
-      const tol = 0.25;                          // timing window (± a quarter of a beat)
+      // detection delay + the device's own audio output delay (bigger with Bluetooth), in beats
+      const lat = (0.12 + (ctx.outputLatency || 0) + (ctx.baseLatency || 0)) * bpmRun / 60;
+      const tol = LV().tol;                      // timing window (± beats), set by Strictness
       if (ev != null) {
         let best = null, bd = 1e9;
         for (const s of steps) {
           if (s.status) continue;
           const dt = (ph - lat) - s.t;
-          if (dt < -tol || dt > tol + 0.2) continue;
+          if (dt < -tol || dt > tol + 0.15) continue;
           if (!matches(s, ev)) continue;
           if (Math.abs(dt) < bd) { bd = Math.abs(dt); best = s; }
         }
-        if (best) { best.status = "hit"; setHeard(spell(ev), "ok"); }
+        if (best) { best.status = "hit"; setHeard(best.notes[0].name, "ok"); }
         else if (!steps.some(s => s.t > ph - lat - 1.2 && s.t < ph + 0.3 && matches(s, ev))) {
           mistakes++; setHeard(spell(ev) + " ✗", "bad");   // a note that isn't anywhere nearby in the music
         }
       }
-      for (const s of steps) if (!s.status && s.t >= runStart - 1e-6 && ph - lat > s.t + tol + 0.25) s.status = "miss";
+      for (const s of steps) if (!s.status && s.t >= runStart - 1e-6 && ph - lat > s.t + tol + 0.2) s.status = "miss";
       cur = steps.findIndex(s => s.t >= Math.max(ph, runStart) - 0.05); if (cur < 0) cur = steps.length;
     } else {
       cur = steps.findIndex(s => s.t >= Math.max(ph, runStart) - 0.05); if (cur < 0) cur = steps.length;
@@ -521,6 +637,10 @@ let bannerTimer;
 function showBanner(html, ms) {
   const b = $("banner"); b.innerHTML = html; b.classList.add("show");
   clearTimeout(bannerTimer); if (ms) bannerTimer = setTimeout(() => b.classList.remove("show"), ms);
+}
+function updateLevelLabel() {
+  const L = LV();
+  $("levelLabel").textContent = `${L.name} · pass ${L.pass}%`;
 }
 function updateBpmLabel() {
   $("bpmLabel").textContent = `♩ = ${S.bpm}  (${Math.round(100 * S.bpm / FULL_TEMPO)}%)`;
@@ -662,6 +782,8 @@ function init() {
   $("from").value = S.from; $("to").value = S.to;
   setSeg($("mode"), S.mode); setSeg($("hand"), S.hand);
   $("bpm").value = S.bpm; updateBpmLabel();
+  $("level").value = S.level; updateLevelLabel();
+  $("level").oninput = () => { S.level = +$("level").value; updateLevelLabel(); save(); };
   for (const k of ["click", "auto", "accomp", "names", "strict"]) {
     $(k).checked = S[k]; $(k).onchange = () => { S[k] = $(k).checked; save(); };
   }
